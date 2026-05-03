@@ -468,7 +468,7 @@ def _get_png_text_value(img: Image, key: str):
     """Return a PNG text chunk value from Pillow's text/info maps.
 
     Foundation0 Studio stores the ComfyUI API graph in a non-standard
-    ``workflowApiJSON`` PNG text chunk when the normal ``prompt`` chunk is not
+    ``workflowApiJSON`` or ``workflow`` PNG text chunk when the normal ``prompt`` chunk is not
     present.  Pillow may expose text chunks through either ``img.text`` or
     ``img.info`` depending on the loader/version, so check both.
     """
@@ -606,6 +606,15 @@ def _get_comfyui_prompt_string(img: Image):
         if workflow_api_json and (_is_foundation0_generated(img) or _looks_like_comfyui_graph(workflow_api_json)):
             return workflow_api_json
 
+        # Some Foundation0 Studio PNGs store the executable ComfyUI API graph
+        # directly in the standard-looking "workflow" text chunk, while omitting
+        # the normal "prompt" chunk. Treat graph-shaped workflow text as the
+        # prompt graph too; otherwise these images are detected as non-ComfyUI
+        # before metadata extraction even starts.
+        workflow = _get_png_text_value(img, "workflow")
+        if workflow and (_is_foundation0_generated(img) or _looks_like_comfyui_graph(workflow)):
+            return workflow
+
         parameters = _get_png_text_value(img, "parameters")
         if parameters and _looks_like_comfyui_graph(parameters):
             return parameters
@@ -622,7 +631,7 @@ def _get_comfyui_prompt_string(img: Image):
 
 
 def get_comfyui_prompt_graph(img: Image) -> Dict[str, Any]:
-    """Parse the embedded ComfyUI API graph, including Foundation0 workflowApiJSON."""
+    """Parse the embedded ComfyUI API graph, including Foundation0 workflowApiJSON/workflow."""
     prompt = _get_comfyui_prompt_string(img)
     if not prompt:
         return {}
@@ -974,7 +983,7 @@ def get_comfyui_exif_data(img: Image):
     else:
         pos_prompt, neg_prompt = extract_comfyui_prompt_with_wildcard_support(data, KSampler_entry)
 
-        if _is_foundation0_generated(img) or _get_png_text_value(img, "workflowApiJSON"):
+        if _is_foundation0_generated(img) or _get_png_text_value(img, "workflowApiJSON") or _get_png_text_value(img, "workflow"):
             if not pos_prompt:
                 pos_prompt = _find_comfyui_prompt_by_title(data, "Positive Prompt(Input)")
             if not neg_prompt:

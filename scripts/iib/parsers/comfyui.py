@@ -43,6 +43,7 @@ class ComfyUIParser:
             logger.error(
                 img.info.get("prompt")
                 or img.info.get("workflowApiJSON")
+                or img.info.get("workflow")
                 or str(bool(get_comfyui_prompt_graph(img)))
             )
             return ImageGenerationInfo(
