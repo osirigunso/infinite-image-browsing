@@ -5,6 +5,7 @@ from scripts.iib.tool import (
     is_img_created_by_comfyui,
     is_img_created_by_comfyui_with_webui_gen_info,
     get_comfyui_exif_data,
+    get_comfyui_prompt_graph,
     parse_generation_parameters,
     read_sd_webui_gen_info_from_image,
 )
@@ -30,10 +31,20 @@ class ComfyUIParser:
                 params = parse_generation_parameters(info)
             else:
                 params = get_comfyui_exif_data(img)
+                if not params:
+                    return ImageGenerationInfo(
+                        params=ImageGenerationParams(
+                            meta={"final_width": width, "final_height": height}
+                        )
+                    )
                 info = comfyui_exif_data_to_str(params)
         except Exception as e:
             logger.error("parse comfyui image failed. prompt:", exc_info=e)
-            logger.error(img.info.get("prompt"))
+            logger.error(
+                img.info.get("prompt")
+                or img.info.get("workflowApiJSON")
+                or str(bool(get_comfyui_prompt_graph(img)))
+            )
             return ImageGenerationInfo(
                 params=ImageGenerationParams(
                     meta={"final_width": width, "final_height": height}

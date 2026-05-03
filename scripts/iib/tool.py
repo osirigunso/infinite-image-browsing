@@ -463,145 +463,459 @@ def get_img_geninfo_txt_path(path: str):
     if os.path.exists(txt_path):
         return txt_path
 
-def is_img_created_by_comfyui(img: Image):
+
+def _get_png_text_value(img: Image, key: str):
+    """Return a PNG text chunk value from Pillow's text/info maps.
+
+    Foundation0 Studio stores the ComfyUI API graph in a non-standard
+    ``workflowApiJSON`` PNG text chunk when the normal ``prompt`` chunk is not
+    present.  Pillow may expose text chunks through either ``img.text`` or
+    ``img.info`` depending on the loader/version, so check both.
+    """
+    try:
+        text_map = getattr(img, "text", None)
+        if isinstance(text_map, dict):
+            value = text_map.get(key)
+            if value not in [None, ""]:
+                return value
+    except Exception:
+        pass
+
+    try:
+        info = getattr(img, "info", {}) or {}
+        value = info.get(key)
+        if value not in [None, ""]:
+            return value
+    except Exception:
+        pass
+
+    return None
+
+
+def _get_generated_by(img: Image) -> str:
+    """Read the generator marker from PNG text chunks or EXIF-like entries."""
     if img.format == "PNG":
-        prompt = img.info.get('prompt') or img.info.get('parameters')
-        return prompt and (img.info.get('workflow') or ("class_type" in prompt)) # ermanitu
-    elif img.format == "WEBP" or img.format == "JPEG":
-        exif = img.info.get("exif")
-        split = [x.decode("utf-8", errors="ignore") for x in exif.split(b"\x00")]
-        workflow_str = find(split, lambda x: x.lower().startswith("workflow:"))
-        prompt_str = find(split, lambda x: x.lower().startswith("prompt:"))
-        if workflow_str and prompt_str:
-            workflow = json.loads(workflow_str.split(":", 1)[1])
-            prompt = json.loads(prompt_str.split(":", 1)[1])
-            return (
-                workflow
-                and prompt
-                and any("class_type" in x.keys() for x in prompt.values())
-            )
-        # Fallback: non-standard EXIF (e.g. UserComment in IFD0 with type BYTE)
-        # where null-byte split produces single chars instead of meaningful entries
+        value = _get_png_text_value(img, "GeneratedBy")
+        return str(value).strip() if value else ""
+
+    if img.format in ("WEBP", "JPEG"):
+        exif = (getattr(img, "info", {}) or {}).get("exif")
+        if not exif:
+            return ""
+        value = _find_exif_prefixed_value(exif, "generatedby")
+        return str(value).strip() if value else ""
+
+    return ""
+
+
+def _is_foundation0_generated(img: Image) -> bool:
+    return _get_generated_by(img).strip().casefold() in {
+        "foundation0 studio",
+        "foundation0.link studio",
+    }
+
+
+def _looks_like_comfyui_graph(value: Any) -> bool:
+    if isinstance(value, dict):
+        data = value
+    elif isinstance(value, str):
+        if "class_type" not in value:
+            return False
+        try:
+            data = json.loads(value)
+        except Exception:
+            return False
+    else:
+        return False
+
+    if not isinstance(data, dict):
+        return False
+
+    return any(
+        isinstance(node, dict) and "class_type" in node
+        for node in data.values()
+    )
+
+
+def _decode_exif_fragments(exif: bytes) -> List[str]:
+    fragments: List[str] = []
+    if not exif:
+        return fragments
+
+    try:
+        fragments.extend(
+            x.decode("utf-8", errors="ignore")
+            for x in exif.split(b"\x00")
+            if x
+        )
+    except Exception:
+        pass
+
+    try:
         raw = _extract_usercomment_from_raw_exif(exif)
         if raw:
-            try:
-                decoded = raw.decode("utf-16", errors="ignore").strip('\x00')
-            except Exception:
-                decoded = raw.decode("utf-8", errors="ignore").strip('\x00')
-            if decoded:
-                wf = find([decoded], lambda x: x.lower().startswith("workflow:"))
-                pt = find([decoded], lambda x: x.lower().startswith("prompt:"))
-                if wf and pt:
-                    try:
-                        workflow = json.loads(wf.split(":", 1)[1])
-                        prompt = json.loads(pt.split(":", 1)[1])
-                        return workflow and prompt and any(
-                            "class_type" in x.keys() for x in prompt.values()
-                        )
-                    except Exception:
-                        pass
+            for encoding in ("utf-16", "utf-8"):
+                try:
+                    decoded = raw.decode(encoding, errors="ignore").strip("\x00")
+                    if decoded:
+                        fragments.append(decoded)
+                        break
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return fragments
+
+
+def _find_exif_prefixed_value(exif: bytes, prefix: str) -> Optional[str]:
+    wanted = prefix.casefold() + ":"
+    for fragment in _decode_exif_fragments(exif):
+        if fragment.casefold().startswith(wanted):
+            return fragment.split(":", 1)[1]
+
+        # Some encoders place several textual fields into one UserComment.
+        # Accept values beginning after a newline or a null-byte decode boundary.
+        pattern = re.compile(rf"(?:^|[\r\n]){re.escape(prefix)}\s*:\s*(.+)", re.IGNORECASE | re.DOTALL)
+        match = pattern.search(fragment)
+        if match:
+            return match.group(1).strip()
+
+    return None
+
+
+def _get_comfyui_prompt_string(img: Image):
+    """Return the ComfyUI API graph string embedded in an image.
+
+    Standard ComfyUI PNGs use the ``prompt`` text chunk.  Foundation0 Studio may
+    omit ``prompt`` and instead write the API graph to ``workflowApiJSON``.
+    This helper is intentionally shared by detection, parsing, and parser-side
+    prompt override logic so support does not drift between files.
+    """
+    info = getattr(img, "info", {}) or {}
+
+    if img.format == "PNG":
+        prompt = _get_png_text_value(img, "prompt")
+        if prompt:
+            return prompt
+
+        # Fixed: the comparison is case-normalized on both sides.  Also allow
+        # workflowApiJSON when it exists and is graph-shaped; this makes the
+        # parser robust to missing/variant GeneratedBy strings.
+        workflow_api_json = _get_png_text_value(img, "workflowApiJSON")
+        if workflow_api_json and (_is_foundation0_generated(img) or _looks_like_comfyui_graph(workflow_api_json)):
+            return workflow_api_json
+
+        parameters = _get_png_text_value(img, "parameters")
+        if parameters and _looks_like_comfyui_graph(parameters):
+            return parameters
+
+        return None
+
+    if img.format in ("WEBP", "JPEG"):
+        exif = info.get("exif")
+        if not exif:
+            return None
+        return _find_exif_prefixed_value(exif, "prompt")
+
+    return None
+
+
+def get_comfyui_prompt_graph(img: Image) -> Dict[str, Any]:
+    """Parse the embedded ComfyUI API graph, including Foundation0 workflowApiJSON."""
+    prompt = _get_comfyui_prompt_string(img)
+    if not prompt:
+        return {}
+
+    try:
+        data = json.loads(prompt)
+    except Exception:
+        return {}
+
+    return data if isinstance(data, dict) else {}
+
+
+def _graph_has_comfyui_nodes(data: Dict[str, Any]) -> bool:
+    return isinstance(data, dict) and any(
+        isinstance(node, dict) and "class_type" in node
+        for node in data.values()
+    )
+
+
+def is_img_created_by_comfyui(img: Image):
+    prompt = _get_comfyui_prompt_string(img)
+    if not prompt:
         return False
-    else:
-        return False  # unsupported format
+
+    if img.format == "PNG":
+        workflow = _get_png_text_value(img, "workflow") or (getattr(img, "info", {}) or {}).get("workflow")
+        if workflow:
+            return True
+        data = get_comfyui_prompt_graph(img)
+        if data:
+            return _graph_has_comfyui_nodes(data)
+        return "class_type" in str(prompt)
+
+    if img.format in ("WEBP", "JPEG"):
+        data = get_comfyui_prompt_graph(img)
+        return _graph_has_comfyui_nodes(data)
+
+    return False  # unsupported format
+
 
 def is_img_created_by_comfyui_with_webui_gen_info(img: Image):
-    return is_img_created_by_comfyui(img) and img.info.get('parameters')
+    return is_img_created_by_comfyui(img) and (getattr(img, "info", {}) or {}).get("parameters")
 
+
+def _get_comfyui_node(data: Dict[str, Any], node_id: Any) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        return {}
+    node = data.get(str(node_id))
+    return node if isinstance(node, dict) else {}
+
+
+def _get_comfyui_inputs(data: Dict[str, Any], node_id: Any) -> Dict[str, Any]:
+    node = _get_comfyui_node(data, node_id)
+    inputs = node.get("inputs", {}) if isinstance(node, dict) else {}
+    return inputs if isinstance(inputs, dict) else {}
+
+
+def _comfyui_ref_node_id(value: Any) -> Optional[Any]:
+    if isinstance(value, list) and len(value) >= 1:
+        return value[0]
+    return None
+
+
+def _resolve_comfyui_primitive(data: Dict[str, Any], value: Any) -> Any:
+    ref_id = _comfyui_ref_node_id(value)
+    if ref_id is None:
+        return value
+
+    ref_inputs = _get_comfyui_inputs(data, ref_id)
+    if "value" in ref_inputs:
+        return ref_inputs.get("value")
+
+    return value
+
+
+def _comfyui_to_number(data: Dict[str, Any], value: Any) -> Any:
+    value = _resolve_comfyui_primitive(data, value)
+    try:
+        if isinstance(value, (int, float)):
+            return value
+        s = str(value).strip()
+        if re.fullmatch(r"-?\d+", s):
+            return int(s)
+        if re.fullmatch(r"-?\d+(\.\d+)?", s):
+            return float(s)
+    except Exception:
+        pass
+    return value
+
+
+def _find_comfyui_ksampler_id(data: Dict[str, Any]) -> str:
+    for node_id, node in data.items():
+        try:
+            class_type = str(node.get("class_type", ""))
+            if class_type.startswith("KSampler"):
+                return str(node_id)
+        except Exception:
+            pass
+    return ""
+
+
+def _resolve_comfyui_model_name(data: Dict[str, Any], ref: Any, visited: Optional[set] = None) -> Optional[str]:
+    """Follow KSampler.model through wrapper/LoRA nodes until a checkpoint name is found."""
+    node_id = _comfyui_ref_node_id(ref) if isinstance(ref, list) else ref
+    if node_id is None:
+        return None
+
+    node_key = str(node_id)
+    if visited is None:
+        visited = set()
+    if node_key in visited:
+        return None
+    visited.add(node_key)
+
+    node = _get_comfyui_node(data, node_key)
+    if not node:
+        return None
+
+    inputs = node.get("inputs", {}) or {}
+    if not isinstance(inputs, dict):
+        return None
+
+    for key in ("ckpt_name", "checkpoint_name", "model_name", "unet_name"):
+        value = inputs.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    # Prefer model-like edges.  This fixes KSampler -> LoadLoRAFromMultipleFiles
+    # -> CheckpointLoaderSimple without wandering into unrelated image/text inputs.
+    for key in ("model", "base_model", "ckpt", "checkpoint"):
+        value = inputs.get(key)
+        ref_id = _comfyui_ref_node_id(value)
+        if ref_id is not None:
+            resolved = _resolve_comfyui_model_name(data, ref_id, visited)
+            if resolved:
+                return resolved
+
+    # Last-resort traversal for custom wrapper nodes with non-standard input names.
+    for value in inputs.values():
+        ref_id = _comfyui_ref_node_id(value)
+        if ref_id is not None:
+            resolved = _resolve_comfyui_model_name(data, ref_id, visited)
+            if resolved:
+                return resolved
+
+    return None
+
+
+def _find_comfyui_checkpoint_hint(data: Dict[str, Any]) -> Optional[str]:
+    for node in data.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs", {}) or {}
+        if not isinstance(inputs, dict):
+            continue
+        for key in ("ckpt_name", "checkpoint_name", "model_name"):
+            value = inputs.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _normalize_comfyui_text(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value if value else None
+
+
+def _resolve_comfyui_text_ref(data: Dict[str, Any], ref: Any, visited: Optional[set] = None) -> str:
+    node_id = _comfyui_ref_node_id(ref) if isinstance(ref, list) else ref
+    if node_id is None:
+        text = _normalize_comfyui_text(ref)
+        return text or ""
+
+    node_key = str(node_id)
+    if visited is None:
+        visited = set()
+    if node_key in visited:
+        return ""
+    visited.add(node_key)
+
+    node = _get_comfyui_node(data, node_key)
+    if not node:
+        return ""
+
+    class_type = str(node.get("class_type", ""))
+    inputs = node.get("inputs", {}) or {}
+    if not isinstance(inputs, dict):
+        return ""
+
+    if class_type == "ImpactWildcardProcessor":
+        for key in ("populated_text", "text"):
+            text = _normalize_comfyui_text(inputs.get(key))
+            if text:
+                return text
+        # Deliberately do not use wildcard_text here: that is the template, not
+        # the populated prompt that was actually used.
+
+    if "CLIPTextEncode" in class_type:
+        for key in ("text", "t5xxl"):
+            if key in inputs:
+                value = inputs.get(key)
+                text = _normalize_comfyui_text(value)
+                if text:
+                    return text
+                ref_id = _comfyui_ref_node_id(value)
+                if ref_id is not None:
+                    resolved = _resolve_comfyui_text_ref(data, ref_id, visited)
+                    if resolved:
+                        return resolved
+
+    if class_type == "FluxGuidance":
+        conditioning = inputs.get("conditioning")
+        ref_id = _comfyui_ref_node_id(conditioning)
+        if ref_id is not None:
+            resolved = _resolve_comfyui_text_ref(data, ref_id, visited)
+            if resolved:
+                return resolved
+
+    for key in ("populated_text", "text", "t5xxl", "prompt", "string", "value"):
+        if key not in inputs:
+            continue
+        value = inputs.get(key)
+        text = _normalize_comfyui_text(value)
+        if text:
+            return text
+        ref_id = _comfyui_ref_node_id(value)
+        if ref_id is not None:
+            resolved = _resolve_comfyui_text_ref(data, ref_id, visited)
+            if resolved:
+                return resolved
+
+    for key in ("conditioning", "positive", "negative"):
+        ref_id = _comfyui_ref_node_id(inputs.get(key))
+        if ref_id is not None:
+            resolved = _resolve_comfyui_text_ref(data, ref_id, visited)
+            if resolved:
+                return resolved
+
+    return ""
+
+
+def _find_comfyui_prompt_by_title(data: Dict[str, Any], title: str) -> str:
+    wanted = title.strip().casefold()
+    for node_id, node in data.items():
+        try:
+            if node.get("class_type") != "PrimitiveStringMultiline":
+                continue
+            meta = node.get("_meta", {}) or {}
+            if str(meta.get("title", "")).strip().casefold() == wanted:
+                value = _get_comfyui_inputs(data, node_id).get("value", "")
+                return str(value).strip()
+        except Exception:
+            pass
+    return ""
+
+
+def _extract_comfyui_size(data: Dict[str, Any], ksampler_inputs: Dict[str, Any]) -> Optional[str]:
+    latent_ref = ksampler_inputs.get("latent_image")
+    latent_id = _comfyui_ref_node_id(latent_ref)
+    if latent_id is not None:
+        latent_inputs = _get_comfyui_inputs(data, latent_id)
+        width = _comfyui_to_number(data, latent_inputs.get("width"))
+        height = _comfyui_to_number(data, latent_inputs.get("height"))
+        if width not in [None, ""] and height not in [None, ""]:
+            return f"{width}x{height}"
+
+    # Foundation0 workflows often carry width/height as primitive nodes even when
+    # the KSampler receives an encoded image rather than EmptyLatentImage.
+    width = height = None
+    for node_id, node in data.items():
+        try:
+            inputs = node.get("inputs", {}) or {}
+            meta = node.get("_meta", {}) or {}
+            title = str(meta.get("title", "")).strip().casefold()
+            if title == "width":
+                width = _comfyui_to_number(data, inputs.get("value"))
+            elif title == "height":
+                height = _comfyui_to_number(data, inputs.get("value"))
+        except Exception:
+            pass
+    if width not in [None, ""] and height not in [None, ""]:
+        return f"{width}x{height}"
+
+    return None
 
 
 def extract_comfyui_prompt_with_wildcard_support(data: Dict, KSampler_entry: Dict):
-    """
-    Enhanced prompt extraction for workflows using ImpactWildcardProcessor.
-
-    This function handles:
-    - populated_text over wildcard_text
-    - Recursive resolution of upstream prompt nodes
-    - Intermediate conditioning nodes such as FluxGuidance
-
-    Returns:
-        tuple of (positive_prompt, negative_prompt)
-    """
-
-    def get_node(node_id):
-        return data.get(str(node_id)) or data.get(node_id)
-
-    def normalize_text(value):
-        if not isinstance(value, str):
-            return None
-        return value.strip()
-
-    def extract_direct_text(node):
-        if not isinstance(node, dict):
-            return None, False
-
-        class_type = node.get("class_type", "")
-        inputs = node.get("inputs", {}) or {}
-
-        if class_type == "ImpactWildcardProcessor":
-            populated = normalize_text(inputs.get("populated_text"))
-            return (populated or ""), True
-
-        if "CLIPTextEncode" in class_type:
-            for key in ("text", "t5xxl"):
-                if key in inputs:
-                    value = inputs.get(key)
-                    if isinstance(value, str):
-                        return value.strip(), True
-                    if isinstance(value, list) and len(value) >= 1:
-                        return None, False
-                    return "", True
-
-        for key in ("text", "t5xxl", "prompt", "string", "value"):
-            if key in inputs and isinstance(inputs.get(key), str):
-                return inputs.get(key).strip(), True
-
-        return None, False
-
-    def resolve_text_from_ref(ref, visited=None):
-        if visited is None:
-            visited = set()
-
-        node_id = ref[0] if isinstance(ref, list) and len(ref) >= 1 else ref
-        node_key = str(node_id)
-        if not node_key or node_key in visited:
-            return ""
-        visited.add(node_key)
-
-        node = get_node(node_id)
-        if not isinstance(node, dict):
-            return ""
-
-        direct_text, is_terminal = extract_direct_text(node)
-        if direct_text is not None:
-            return direct_text
-        if is_terminal:
-            return ""
-
-        inputs = node.get("inputs", {}) or {}
-        class_type = node.get("class_type", "")
-
-        if class_type == "FluxGuidance":
-            conditioning = inputs.get("conditioning")
-            if isinstance(conditioning, list) and len(conditioning) >= 1:
-                return resolve_text_from_ref(conditioning, visited)
-            return ""
-
-        for key in ("text", "t5xxl", "conditioning", "positive", "negative", "prompt", "string", "value"):
-            value = inputs.get(key)
-            if isinstance(value, list) and len(value) >= 1:
-                resolved = resolve_text_from_ref(value, visited)
-                if resolved or resolved == "":
-                    return resolved
-
-        return ""
-
+    """Return positive/negative prompts with recursive text-node resolution."""
     try:
-        positive_ref = KSampler_entry.get("positive")
-        negative_ref = KSampler_entry.get("negative")
-
-        positive_prompt = resolve_text_from_ref(positive_ref) if positive_ref else ""
-        negative_prompt = resolve_text_from_ref(negative_ref) if negative_ref else ""
-
+        positive_prompt = _resolve_comfyui_text_ref(data, KSampler_entry.get("positive"))
+        negative_prompt = _resolve_comfyui_text_ref(data, KSampler_entry.get("negative"))
         return positive_prompt or "", negative_prompt or ""
     except Exception as e:
         print(e)
@@ -609,141 +923,81 @@ def extract_comfyui_prompt_with_wildcard_support(data: Dict, KSampler_entry: Dic
 
 
 def get_comfyui_exif_data(img: Image):
-    prompt = None
-    if img.format == "PNG":
-        prompt = img.info.get('prompt')
-    elif img.format == "WEBP":
-        exif = img.info.get("exif")
-        if exif:
-            split = [x.decode("utf-8", errors="ignore") for x in exif.split(b"\x00")]
-            prompt_str = find(split, lambda x: x.lower().startswith("prompt:"))
-            if prompt_str:
-                prompt = prompt_str.split(":", 1)[1] if prompt_str else None
-    if not prompt:
+    data: Dict[str, Any] = get_comfyui_prompt_graph(img)
+    if not data:
         return {}
 
-    data: Dict[str, Any] = json.loads(prompt)
-    meta_key = '3'
-    for i in data.keys():
-        try:
-            if data[i]["class_type"].startswith("KSampler"):
-                meta_key = i
-                break
-        except Exception:
-            pass
+    meta_key = _find_comfyui_ksampler_id(data)
+    if not meta_key or meta_key not in data:
+        return {}
 
-    if meta_key not in data:
+    KSampler_entry = data[meta_key].get("inputs", {}) or {}
+    if not isinstance(KSampler_entry, dict):
         return {}
 
     meta = {}
-    KSampler_entry = data[meta_key]["inputs"]
-
-    # As a workaround to bypass parsing errors in the parser.
-    # https://github.com/jiw0220/stable-diffusion-image-metadata/blob/00b8d42d4d1a536862bba0b07c332bdebb2a0ce5/src/index.ts#L130
-    meta["Steps"] = KSampler_entry.get("steps", "Unknown")
+    meta["Steps"] = _comfyui_to_number(data, KSampler_entry.get("steps", "Unknown"))
     meta["Sampler"] = KSampler_entry.get("sampler_name", "Unknown")
-    try:
-        meta["Model"] = data[KSampler_entry["model"][0]]["inputs"].get("ckpt_name")
-    except Exception:
-        meta["Model"] = None
+    if "scheduler" in KSampler_entry:
+        meta["Scheduler"] = KSampler_entry.get("scheduler")
+    if "cfg" in KSampler_entry:
+        meta["CFG scale"] = _comfyui_to_number(data, KSampler_entry.get("cfg"))
+    if "seed" in KSampler_entry:
+        meta["Seed"] = _comfyui_to_number(data, KSampler_entry.get("seed"))
+    if "denoise" in KSampler_entry:
+        meta["Denoising strength"] = _comfyui_to_number(data, KSampler_entry.get("denoise"))
+
+    model_name = _resolve_comfyui_model_name(data, KSampler_entry.get("model")) or _find_comfyui_checkpoint_hint(data)
+    meta["Model"] = model_name
     meta["Source Identifier"] = "ComfyUI"
 
-    def get_text_from_clip(idx: str):
-        try:
-            inputs = data[idx]["inputs"]
-            if "text" in inputs:
-                text = inputs["text"]
-            elif "t5xxl" in inputs:
-                text = inputs["t5xxl"]
-            else:
-                return ""
-            if isinstance(text, list):  # type:CLIPTextEncode (NSP) mode:Wildcards
-                text = data[text[0]]["inputs"]["text"]
-            return text.strip()
-        except Exception as e:
-            print(e)
-            return ""
-
-    has_impact_wildcard = any(
-        node_data.get("class_type") == "ImpactWildcardProcessor"
-        for node_data in data.values()
-        if isinstance(node_data, dict)
-    )
-
-    # Detection Point 1: Check if workflow contains ImpactWildcardProcessor
-    # If yes, immediately use the enhanced extraction and return
-    if has_impact_wildcard:
-        pos_prompt, neg_prompt = extract_comfyui_prompt_with_wildcard_support(
-            data, KSampler_entry
-        )
-        pos_prompt_arr = unique_by(parse_prompt(pos_prompt)["pos_prompt"])
-        return {
-            "meta": meta,
-            "pos_prompt": pos_prompt_arr,
-            "pos_prompt_raw": pos_prompt,
-            "neg_prompt_raw": neg_prompt
-        }
+    size = _extract_comfyui_size(data, KSampler_entry)
+    if size:
+        meta["Size"] = size
 
     extract_all_prompts = os.getenv("IIB_COMFYUI_EXTRACT_ALL_PROMPTS", "false").lower() == "true"
 
     if extract_all_prompts:
-        # 注意：此模式下无法自动区分正向和负向提示词，会全部归到正向提示词中
-        # 如需区分正负向，需根据工作流结构调整解析逻辑
         all_prompts = []
         for node_id, node_data in data.items():
             try:
-                class_type = node_data.get("class_type", "")
-                inputs = node_data.get("inputs", {})
-
-                if "CLIPTextEncode" in class_type:
-                    text = inputs.get("text", "")
-                    if isinstance(text, list):
-                        text = data[text[0]]["inputs"].get("text", "")
+                class_type = str(node_data.get("class_type", ""))
+                if "CLIPTextEncode" in class_type or class_type == "ImpactWildcardProcessor":
+                    text = _resolve_comfyui_text_ref(data, node_id)
                     if text:
-                        all_prompts.append(text.strip())
+                        all_prompts.append(text)
             except Exception as e:
                 print(e)
                 pass
-
-        all_prompts_str = "\nBREAK\n".join(all_prompts) if all_prompts else ""
-        pos_prompt = all_prompts_str
+        pos_prompt = "\nBREAK\n".join(all_prompts) if all_prompts else ""
         neg_prompt = ""
     else:
-        in_node = data[str(KSampler_entry["positive"][0])]
-        if in_node["class_type"] != "FluxGuidance":
-            pos_prompt = get_text_from_clip(KSampler_entry["positive"][0])
-        else:
-            pos_prompt = get_text_from_clip(in_node["inputs"]["conditioning"][0])
+        pos_prompt, neg_prompt = extract_comfyui_prompt_with_wildcard_support(data, KSampler_entry)
 
-        neg_prompt = get_text_from_clip(KSampler_entry["negative"][0])
+        if _is_foundation0_generated(img) or _get_png_text_value(img, "workflowApiJSON"):
+            if not pos_prompt:
+                pos_prompt = _find_comfyui_prompt_by_title(data, "Positive Prompt(Input)")
+            if not neg_prompt:
+                neg_prompt = _find_comfyui_prompt_by_title(data, "Negative Prompt(Input)")
 
     pos_prompt_arr = unique_by(parse_prompt(pos_prompt)["pos_prompt"])
-
-    # Detection Point 2: Fallback if no prompts were extracted
-    # If standard extraction failed, try the enhanced method
-    if has_impact_wildcard and (not pos_prompt_arr or not pos_prompt.strip()):
-        pos_prompt_fallback, neg_prompt_fallback = extract_comfyui_prompt_with_wildcard_support(
-            data, KSampler_entry
-        )
-        if pos_prompt_fallback:
-            pos_prompt = pos_prompt_fallback
-            pos_prompt_arr = unique_by(parse_prompt(pos_prompt_fallback)["pos_prompt"])
-
-        if neg_prompt_fallback:
-            neg_prompt = neg_prompt_fallback
-
     return {
         "meta": meta,
         "pos_prompt": pos_prompt_arr,
         "pos_prompt_raw": pos_prompt,
-        "neg_prompt_raw": neg_prompt
+        "neg_prompt_raw": neg_prompt,
     }
 
+
 def comfyui_exif_data_to_str(data):
-    res = data["pos_prompt_raw"] + "\nNegative prompt: " + data["neg_prompt_raw"] + "\n"
+    if not isinstance(data, dict):
+        data = {}
+    pos_prompt_raw = data.get("pos_prompt_raw", "") or ""
+    neg_prompt_raw = data.get("neg_prompt_raw", "") or ""
+    res = pos_prompt_raw + "\nNegative prompt: " + neg_prompt_raw + "\n"
     meta_arr = []
-    for k,v in data["meta"].items():
-        meta_arr.append(f'{k}: {v}')
+    for k, v in (data.get("meta", {}) or {}).items():
+        meta_arr.append(f"{k}: {v}")
     return res + ", ".join(meta_arr)
 
 def _extract_usercomment_from_raw_exif(exif_bytes: bytes):
